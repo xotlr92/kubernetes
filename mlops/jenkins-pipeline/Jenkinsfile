@@ -1,0 +1,157 @@
+pipeline {
+    environment {
+        ECR_REGISTRY="123456789.dkr.ecr.ap-northeast-2.amazonaws.com"
+        ECR_REPOSITORY="dlk-ecr-repository"
+        TARGET_FOLDERS="docker/mlops,docker/airflow"
+    }
+    agent {
+        kubernetes {
+            yamlFile "docker/jenkins-pipeline/kubernetesPod.yaml"
+        }
+    }
+    stages {
+        // github 특정 경로에서 push가 발생 시 이후 stage를 실행할 수 있도록 설정
+        stage('Check for Changes in Target Folder') {
+            steps {
+                script {
+                    def changes = sh(script: 'git diff --name-only HEAD^ HEAD', returnStdout: true).trim()
+                    echo "Changed files: ${changes}"
+
+                    def targetFolders = env.TARGET_FOLDERS.split(',')
+                    def changesInTargetFolders = changes.split('\n').findAll { file ->
+                        targetFolders.any { folder -> file.startsWith(folder) }
+                    }
+                    if (changesInTargetFolders.isEmpty()) {
+                        echo "No changes in target folder. Skipping build."
+                        currentBuild.result = 'SUCCESS'
+                    } else {
+                        echo "Changes detected in target folder. Proceeding with build."
+                    }
+                }
+            }
+        }
+        stage('Checkout') {
+            when { expression { !currentBuild.result.equals('SUCCESS') } }
+            steps {
+                checkout scm
+            }
+        }
+        stage('Run Git') {
+            when { expression { !currentBuild.result.equals('SUCCESS') } }
+            steps {
+                script {
+                    env.BASE_TAG = sh(script: 'git diff --name-only HEAD^ HEAD | xargs -r -n 1 dirname', returnStdout: true).trim().split('/')[-1]
+                    echo "Git BASE_TAG: ${env.BASE_TAG}"
+                    env.EVENT_DIR = sh(script: 'git diff --name-only HEAD^ HEAD | xargs -r -n 1 dirname', returnStdout: true).trim()
+                    echo "Git DIR: ${env.EVENT_DIR}"
+                }
+            }
+        }
+        stage('Check App Version') {
+            when { expression { !currentBuild.result.equals('SUCCESS') } }
+            steps {
+                script {
+                    def dockerfileContent = readFile("${env.EVENT_DIR}/Dockerfile")
+                    echo "dockerfileContent: ${dockerfileContent}"
+                    def versionMatch = dockerfileContent =~ /ARG APP_VERSION="?([\d\.]+)"?/
+                    echo "versionMatch: ${versionMatch}"
+
+                    if (versionMatch) {
+                        env.APP_VERSION = versionMatch[0][1]
+                        echo "version: ${env.APP_VERSION}"
+                    } else {
+                        echo "Version information not found in Dockerfile"
+                        env.APP_VERSION = null
+                    }
+                }
+            }
+        }
+        stage('Update TAG Version') {
+            when { expression { !currentBuild.result.equals('SUCCESS') } }
+            steps {
+                container('aws-cli') {
+                    script {
+                        def tagOutput = sh(script: """
+                            aws ecr describe-images --repository-name ${ECR_REPOSITORY} --query 'imageDetails[].imageTags[]' --output json
+                        """, returnStdout: true).trim()
+                        echo "Git tagOutput: ${tagOutput}"
+
+                        // JSON 파싱
+                        def tags = readJSON text: tagOutput
+                        echo "Existing tags: ${tags}"
+
+                        // BASE_TAG로 시작하는 태그 필터링
+                        def versionPattern = ''
+                        if (env.APP_VERSION == "null") {
+                            versionPattern = "^${env.BASE_TAG}-\\d+\\.\\d+\\.\\d+\$"
+                        } else {
+                            versionPattern = "^${env.BASE_TAG}-${env.APP_VERSION}-\\d+\\.\\d+\\.\\d+\$"
+                        }
+                        def versionTags = tags.flatten().findAll { it ==~ versionPattern }
+                        echo "Filtered version tags: ${versionTags}"
+
+                        // 최신 버전 찾기
+                        def latestVersion = '0.0.0'
+                        versionTags.each { tag ->
+                            def version = ''
+                            if (env.APP_VERSION == "null") {
+                                version = tag.replace("${env.BASE_TAG}-", "")
+                            } else {
+                                version = tag.replace("${env.BASE_TAG}-${env.APP_VERSION}-", "")
+                            }
+                            if (compareVersions(version, latestVersion) > 0) {
+                                latestVersion = version
+                            }
+                        }
+                        echo "Latest version: ${latestVersion}"
+
+                        // 새로운 버전 생성
+                        def newVersion = incrementVersion(latestVersion)
+                        if (env.APP_VERSION == "null") {
+                            env.NEW_TAG = "${env.BASE_TAG}-${newVersion}"
+                        } else {
+                            env.NEW_TAG = "${env.BASE_TAG}-${env.APP_VERSION}-${newVersion}"
+                        }
+                        echo "NEW_TAG: ${env.NEW_TAG}"
+                    }
+                }
+            }
+        }
+        stage('Build & Push') {
+            when { expression { !currentBuild.result.equals('SUCCESS') } }
+            steps {
+                container('kaniko'){
+                    script {
+                        echo "Kaniko Build & Push Image to ECR"
+                        sh(script: """
+                            /kaniko/executor \
+                                --dockerfile ${env.EVENT_DIR}/Dockerfile \
+                                --context dir:///home/jenkins/agent/workspace/image-builder \
+                                --destination ${ECR_REGISTRY}/${ECR_REPOSITORY}:${env.NEW_TAG}
+                        """)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 버전 비교 함수 (1이면 version1이 큼, -1이면 version2가 큼, 0이면 같음)
+def compareVersions(version1, version2) {
+  def parts1 = version1.tokenize('.')
+  def parts2 = version2.tokenize('.')
+  for (int i = 0; i < Math.max(parts1.size(), parts2.size()); i++) {
+      int v1 = (i < parts1.size()) ? parts1[i].toInteger() : 0
+      int v2 = (i < parts2.size()) ? parts2[i].toInteger() : 0
+      if (v1 > v2) return 1
+      if (v1 < v2) return -1
+  }
+  return 0
+}
+
+// 버전 증가 함수
+def incrementVersion(version) {
+  def parts = version.tokenize('.')
+  parts[-1] = (parts[-1].toInteger() + 1).toString()
+  return parts.join('.')
+}

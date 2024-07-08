@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: kubernetes-pod
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+            - key: eks.amazonaws.com/nodegroup
+              operator: NotIn
+              values:
+                - management
+            - key: karpenter.sh/nodepool
+              operator: In
+              values:
+                - "datatech"
+            - key: kubernetes.io/arch
+              operator: In
+              values:
+                - amd64
+  tolerations:
+    - key: "node-pool"
+      operator: Equal
+      value: "datatech"
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command:
+      - sleep
+    args:
+      - "99d"
+    tty: true
+  - name: aws-cli
+    image: amazon/aws-cli
+    command:
+    - cat
+    tty: true
